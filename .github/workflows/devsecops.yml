@@ -1,0 +1,81 @@
+name: DevSecOps Pipeline - Juice Shop
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:   # permite re-ejecutarlo a mano desde la pestaña Actions
+
+jobs:
+  # 1. Build & Test: compila el servidor y ejecuta las pruebas unitarias.
+  #    Si alguna prueba falla, el job queda en rojo y los demás NO se ejecutan (Fail Fast).
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'          # Juice Shop actual exige Node 22-26
+      - name: Install Dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Build (compilar TypeScript del servidor)
+        run: npm run build:server
+      - name: Run Unit Tests
+        run: npm run test:server       # ~417 pruebas unitarias del backend
+
+  # 2. SCA: analiza las librerías de terceros (dependencias) en busca de CVE conocidos.
+  security-sca:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run NPM Audit
+        # Modo informativo: || true evita que el job falle, para poder leer el reporte
+        run: npm audit --audit-level=high || true
+
+  # 3. SAST: analiza el código fuente sin ejecutarlo.
+  #    njsscan solo lee archivos .js, por eso se escanea el código ya compilado (build/).
+  security-sast:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+      - name: Build (generar JS para el escáner)
+        run: npm run build:server
+      - name: njsscan
+        uses: ajinabraham/njsscan-action@master
+        continue-on-error: true      # informativo: muestra hallazgos sin romper el pipeline
+        with:
+          args: 'build/routes build/lib build/models build/server.js'
+
+  # 4. (OPCIONAL - Nivel Experto) Quality Gate: rompe el build si hay vulnerabilidades críticas.
+  #    Borra este bloque si solo quieres los 3 jobs obligatorios.
+  security-gate:
+    needs: [ security-sca, security-sast ]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Quality Gate - 0 vulnerabilidades criticas
+        run: |
+          npm audit --json > audit.json || true
+          CRIT=$(jq '.metadata.vulnerabilities.critical' audit.json)
+          echo "Vulnerabilidades criticas encontradas: $CRIT"
+          if [ "$CRIT" -gt 0 ]; then
+            echo "::error::Quality Gate FALLIDO: $CRIT vulnerabilidades criticas. Despliegue bloqueado."
+            exit 1
+          fi
+          echo "Quality Gate APROBADO"
